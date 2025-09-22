@@ -1,48 +1,55 @@
 import discord
 from discord.ext import commands
+import youtube_dl
 import asyncio
 import os
-from pytube import YouTube
-from pytube.exceptions import PytubeError
-import io
 
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='-', intents=intents)
 
+# إعدادات youtube-dl
+ydl_opts = {
+    'format': 'bestaudio/best',
+    'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
+    'restrictfilenames': True,
+    'noplaylist': True,
+    'nocheckcertificate': True,
+    'ignoreerrors': False,
+    'logtostderr': False,
+    'quiet': True,
+    'no_warnings': True,
+    'default_search': 'auto',
+}
+
+ffmpeg_options = {
+    'options': '-vn'
+}
+
+ytdl = youtube_dl.YoutubeDL(ydl_opts)
+
+class YTDLSource(discord.PCMVolumeTransformer):
+    def __init__(self, source, *, data, volume=0.5):
+        super().__init__(source, volume)
+        self.data = data
+        self.title = data.get('title')
+        self.url = data.get('url')
+
+    @classmethod
+    async def from_url(cls, url, *, loop=None, stream=False):
+        loop = loop or asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
+        
+        if 'entries' in data:
+            data = data['entries'][0]
+        
+        filename = data['url'] if stream else ytdl.prepare_filename(data)
+        return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
+
 @bot.event
 async def on_ready():
     print(f'🎵 {bot.user} جاهز للعمل!')
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name="-play"))
-
-async def play_audio(ctx, url):
-    """تشغيل audio من YouTube باستخدام pytube"""
-    try:
-        # تحميل معلومات الفيديو
-        yt = YouTube(url)
-        
-        # الحصول على أفضل audio stream
-        audio_stream = yt.streams.filter(only_audio=True).first()
-        
-        if not audio_stream:
-            await ctx.send("❌ لم أستطع العثور على audio")
-            return None
-            
-        await ctx.send(f"🎵 **جاري التشغيل:** {yt.title}")
-        
-        # تحميل audio إلى memory
-        audio_buffer = io.BytesIO()
-        audio_stream.stream_to_buffer(audio_buffer)
-        audio_buffer.seek(0)
-        
-        return discord.FFmpegPCMAudio(audio_buffer, pipe=True)
-        
-    except PytubeError as e:
-        await ctx.send(f"❌ خطأ في تحميل الفيديو: {e}")
-        return None
-    except Exception as e:
-        await ctx.send(f"❌ خطأ غير متوقع: {e}")
-        return None
 
 @bot.command()
 async def play(ctx, *, query):
@@ -59,23 +66,19 @@ async def play(ctx, *, query):
     
     await ctx.send("🔍 **جاري البحث...**")
     
-    # إذا كان query رابط YouTube
-    if query.startswith('http'):
-        url = query
-    else:
-        # بحث بسيط (سيحتاج تطوير)
-        url = f"ytsearch:{query}"
-        await ctx.send("⚠️ البحث بالنص يحتاج تطوير إضافي، استخدم رابط YouTube مباشرة")
-        return
-    
     try:
-        audio_source = await play_audio(ctx, url)
-        
-        if audio_source and not ctx.voice_client.is_playing():
-            ctx.voice_client.play(audio_source)
-            await ctx.send("✅ **بدأ التشغيل**")
+        # إذا كان رابط YouTube
+        if 'youtube.com' in query or 'youtu.be' in query:
+            player = await YTDLSource.from_url(query, loop=bot.loop, stream=True)
         else:
-            await ctx.send("❌ لم أستطع تشغيل الموسيقى")
+            # بحث على YouTube
+            player = await YTDLSource.from_url(f"ytsearch:{query}", loop=bot.loop, stream=True)
+        
+        if not ctx.voice_client.is_playing():
+            ctx.voice_client.play(player, after=lambda e: print('تم الانتهاء من التشغيل'))
+            await ctx.send(f"🎶 **الآن يعزف:** {player.title}")
+        else:
+            await ctx.send(f"✅ **تمت الإضافة:** {player.title}")
             
     except Exception as e:
         await ctx.send(f"❌ خطأ: {str(e)}")
