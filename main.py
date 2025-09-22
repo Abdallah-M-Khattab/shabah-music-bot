@@ -1,72 +1,52 @@
 import discord
 from discord.ext import commands
-import yt_dlp
 import asyncio
 import os
+from pytube import YouTube
+from pytube.exceptions import PytubeError
+import io
 
-# إعدادات البوت
-intents = discord.Intents.all()
+intents = discord.Intents.default()
+intents.message_content = True
 bot = commands.Bot(command_prefix='-', intents=intents)
-
-# إعدادات الصوت
-# إعدادات yt-dlp المعدلة
-ytdl_format_options = {
-    'format': 'bestaudio/best',
-    'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
-    'restrictfilenames': True,
-    'noplaylist': True,
-    'nocheckcertificate': True,  # ✅ أهم إضافة
-    'ignoreerrors': False,
-    'logtostderr': False,
-    'quiet': True,
-    'no_warnings': True,
-    'default_search': 'auto',
-    'source_address': '0.0.0.0',
-    'extract_flat': False,
-    'verbose': False,
-}
-
-ffmpeg_options = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    'options': '-vn'
-}
-
-ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
-
-class YTDLSource(discord.PCMVolumeTransformer):
-    def __init__(self, source, *, data, volume=0.5):
-        super().__init__(source, volume)
-        self.data = data
-        self.title = data.get('title')
-        self.url = data.get('url')
-
-    @classmethod
-    async def from_url(cls, url, *, loop=None, stream=False):
-        loop = loop or asyncio.get_event_loop()
-        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
-        
-        if 'entries' in data:
-            data = data['entries'][0]
-        
-        filename = data['url'] if stream else ytdl.prepare_filename(data)
-        return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
-
-# قائمة الانتظار
-queues = {}
-
-def get_queue(guild_id):
-    if guild_id not in queues:
-        queues[guild_id] = []
-    return queues[guild_id]
 
 @bot.event
 async def on_ready():
-    print(f'🎵 {bot.user} جاهز للعمل على Railway!')
+    print(f'🎵 {bot.user} جاهز للعمل!')
     await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name="-play"))
+
+async def play_audio(ctx, url):
+    """تشغيل audio من YouTube باستخدام pytube"""
+    try:
+        # تحميل معلومات الفيديو
+        yt = YouTube(url)
+        
+        # الحصول على أفضل audio stream
+        audio_stream = yt.streams.filter(only_audio=True).first()
+        
+        if not audio_stream:
+            await ctx.send("❌ لم أستطع العثور على audio")
+            return None
+            
+        await ctx.send(f"🎵 **جاري التشغيل:** {yt.title}")
+        
+        # تحميل audio إلى memory
+        audio_buffer = io.BytesIO()
+        audio_stream.stream_to_buffer(audio_buffer)
+        audio_buffer.seek(0)
+        
+        return discord.FFmpegPCMAudio(audio_buffer, pipe=True)
+        
+    except PytubeError as e:
+        await ctx.send(f"❌ خطأ في تحميل الفيديو: {e}")
+        return None
+    except Exception as e:
+        await ctx.send(f"❌ خطأ غير متوقع: {e}")
+        return None
 
 @bot.command()
 async def play(ctx, *, query):
-    """تشغيل أغنية"""
+    """تشغيل أغنية من YouTube"""
     if not ctx.author.voice:
         return await ctx.send("❌ يجب ان تدخل روم صوتي اولاً!")
     
@@ -79,75 +59,37 @@ async def play(ctx, *, query):
     
     await ctx.send("🔍 **جاري البحث...**")
     
+    # إذا كان query رابط YouTube
+    if query.startswith('http'):
+        url = query
+    else:
+        # بحث بسيط (سيحتاج تطوير)
+        url = f"ytsearch:{query}"
+        await ctx.send("⚠️ البحث بالنص يحتاج تطوير إضافي، استخدم رابط YouTube مباشرة")
+        return
+    
     try:
-        player = await YTDLSource.from_url(query, loop=bot.loop, stream=True)
-        queue = get_queue(ctx.guild.id)
-        queue.append(player)
+        audio_source = await play_audio(ctx, url)
         
-        if not ctx.voice_client.is_playing():
-            await play_next(ctx)
+        if audio_source and not ctx.voice_client.is_playing():
+            ctx.voice_client.play(audio_source)
+            await ctx.send("✅ **بدأ التشغيل**")
         else:
-            await ctx.send(f"✅ **تمت الإضافة:** {player.title}")
+            await ctx.send("❌ لم أستطع تشغيل الموسيقى")
             
     except Exception as e:
         await ctx.send(f"❌ خطأ: {str(e)}")
-
-async def play_next(ctx):
-    queue = get_queue(ctx.guild.id)
-    if queue:
-        player = queue.pop(0)
-        ctx.voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop))
-        await ctx.send(f"🎶 **الآن يعزف:** {player.title}")
-
-@bot.command()
-async def skip(ctx):
-    """تخطي الأغنية"""
-    if ctx.voice_client and ctx.voice_client.is_playing():
-        ctx.voice_client.stop()
-        await ctx.send("⏭️ **تم التخطي**")
-
-@bot.command()
-async def queue(ctx):
-    """عرض قائمة الانتظار"""
-    queue = get_queue(ctx.guild.id)
-    if not queue:
-        return await ctx.send("📭 **القائمة فارغة**")
-    
-    embed = discord.Embed(title="📋 قائمة الانتظار", color=0x00ff00)
-    for i, player in enumerate(queue[:10], 1):
-        embed.add_field(name=f"{i}. {player.title}", value="", inline=False)
-    
-    await ctx.send(embed=embed)
-
-@bot.command()
-async def pause(ctx):
-    """إيقاف مؤقت"""
-    if ctx.voice_client and ctx.voice_client.is_playing():
-        ctx.voice_client.pause()
-        await ctx.send("⏸️ **متوقف مؤقتاً**")
-
-@bot.command()
-async def resume(ctx):
-    """استئناف التشغيل"""
-    if ctx.voice_client and ctx.voice_client.is_paused():
-        ctx.voice_client.resume()
-        await ctx.send("▶️ **يعود التشغيل**")
 
 @bot.command()
 async def stop(ctx):
     """إيقاف البوت"""
     if ctx.voice_client:
-        queue = get_queue(ctx.guild.id)
-        queue.clear()
         await ctx.voice_client.disconnect()
         await ctx.send("🛑 **تم الإيقاف**")
 
 @bot.command()
 async def ping(ctx):
-    """فحص سرعة البوت"""
     await ctx.send(f'🏓 Pong! {round(bot.latency * 1000)}ms')
 
-if __name__ == "__main__":
-    TOKEN = os.environ['TOKEN']
-
-    bot.run(TOKEN)
+TOKEN = os.environ['TOKEN']
+bot.run(TOKEN)
